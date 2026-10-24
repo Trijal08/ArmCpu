@@ -13,6 +13,54 @@ extern "C" void rtclock_intr (unsigned int);
 // Kernel-internal entries used for secondary CPU startup (Darwin 23 osfmk).
 extern "C" vm_offset_t ml_static_vtop (vm_offset_t);
 extern "C" char LowResetVectorBase[], LowResetVectorEnd[], ResetHandlerData[], const_boot_args[];
+// PSCI CPU_ON entry for a secondary core (armcpu_el2_trampoline below): the firmware starts a core at the exception
+// level it started the boot core at, EL2 on Tensor (the UEFI port drops the boot core to EL1 itself), and XNU's reset
+// vector is EL1 code. The trampoline configures EL2 for an AArch64 EL1 kernel without traps (HCR_EL2.RW, the physical
+// timer, no FP/SIMD traps, virtual ID registers, no stage 2, the GICv3 system register interface) and ERETs to the reset
+// vector, whose physical address arrives as the CPU_ON context id in x0. A core that already runs at EL1 branches
+// straight to it, so the same path serves a board whose firmware keeps EL2.
+extern "C" char armcpu_el2_trampoline[], armcpu_el2_trampoline_end[];
+__asm__ (
+    ".section __TEXT,__text,regular,pure_instructions\n"
+    ".p2align 6\n"
+    ".globl _armcpu_el2_trampoline\n"
+    "_armcpu_el2_trampoline:\n"
+    "  mrs x1, CurrentEL\n"
+    "  cmp x1, #0x8\n"
+    "  b.ne 1f\n"
+    "  msr sctlr_el2, xzr\n"                 // EL2 MMU/caches off; this code runs from memory the boot core cleaned
+    "  mov x1, #(1 << 31)\n"                  // HCR_EL2.RW: EL1 is AArch64; no IRQ/FIQ/SError routing to EL2
+    "  msr hcr_el2, x1\n"
+    "  mrs x1, cnthctl_el2\n"
+    "  orr x1, x1, #3\n"                      // EL1PCTEN | EL1PCEN: physical counter and timer at EL1
+    "  msr cnthctl_el2, x1\n"
+    "  msr cntvoff_el2, xzr\n"
+    "  mov x1, #0x33ff\n"                     // CPTR_EL2 reset value with TFP clear: no FP/SIMD trapping
+    "  msr cptr_el2, x1\n"
+    "  msr hstr_el2, xzr\n"
+    "  mrs x1, midr_el1\n"
+    "  msr vpidr_el2, x1\n"
+    "  mrs x1, mpidr_el1\n"
+    "  msr vmpidr_el2, x1\n"
+    "  msr vttbr_el2, xzr\n"
+    "  msr mdcr_el2, xzr\n"
+    "  mov x1, #0xf\n"                        // ICC_SRE_EL2: SRE | DFB | DIB | Enable (EL1 may use ICC_*_EL1)
+    "  msr S3_4_C12_C9_5, x1\n"
+    "  msr S3_4_C12_C11_0, xzr\n"             // ICH_HCR_EL2: no virtual interrupt controller
+    "  isb\n"
+    "  mov x1, #0x0800\n"                     // SCTLR_EL1 reset value: MMU off, RES1 bits
+    "  movk x1, #0x30d0, lsl #16\n"
+    "  msr sctlr_el1, x1\n"
+    "  mov x1, #0x3c5\n"                      // SPSR_EL2: EL1h, DAIF masked
+    "  msr spsr_el2, x1\n"
+    "  msr elr_el2, x0\n"
+    "  isb\n"
+    "  eret\n"
+    "1:\n"
+    "  br x0\n"
+    ".globl _armcpu_el2_trampoline_end\n"
+    "_armcpu_el2_trampoline_end:\n"
+);
 extern "C" kern_return_t processor_start (processor_t);
 extern "C" kern_return_t kernel_thread_start (void (*) (void *, wait_result_t), void *, thread_t *);
 extern "C" void thread_deallocate (thread_t);
@@ -765,12 +813,16 @@ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
   armcpu_smp_conduit = hvc ? 2 : 1;
   // PSCI 0.2 CPU_ON (SMC64 function id); the entry point is the kernel's physical reset vector page, whose reset
   // code selects this core's cpu_data entry by MPIDR affinity. The context id is unused by that code.
-  uint64_t entry = static_cast<uint64_t> (ml_static_vtop (reinterpret_cast<vm_offset_t> (LowResetVectorBase)));
+  // The core enters armcpu_el2_trampoline, which drops it to EL1 when the firmware started it at EL2, and arrives at the
+  // reset vector through the context id.
+  uint64_t entry = static_cast<uint64_t> (ml_static_vtop (reinterpret_cast<vm_offset_t> (armcpu_el2_trampoline)));
+  uint64_t reset = static_cast<uint64_t> (ml_static_vtop (reinterpret_cast<vm_offset_t> (LowResetVectorBase)));
+  cleanToMemory (armcpu_el2_trampoline, static_cast<size_t> (armcpu_el2_trampoline_end - armcpu_el2_trampoline));
   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
   cleanToMemory (ResetHandlerData, 0x1000);
   cleanToMemory (const_boot_args, 0x1000);
   armcpu_smp_step[logicalId] = 4;
-  int64_t result = psciCall (hvc, 0xc4000003ULL, affinity & 0xff00ffffffULL, entry, 0);
+  int64_t result = psciCall (hvc, 0xc4000003ULL, affinity & 0xff00ffffffULL, entry, reset);
   armcpu_smp_psci_rc[logicalId] = static_cast<int32_t> (result);
   return result == 0 ? KERN_SUCCESS : KERN_FAILURE;
 }

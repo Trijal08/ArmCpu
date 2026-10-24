@@ -20,6 +20,11 @@ extern "C" char LowResetVectorBase[], LowResetVectorEnd[], ResetHandlerData[], c
 // vector, whose physical address arrives as the CPU_ON context id in x0. A core that already runs at EL1 branches
 // straight to it, so the same path serves a board whose firmware keeps EL2.
 extern "C" char armcpu_el2_trampoline[], armcpu_el2_trampoline_end[];
+// XNU keeps time with the virtual counter (CNTVCT_EL0 = CNTPCT_EL0 - CNTVOFF_EL2) and copies the boot core's timebase to
+// every core, so every core must carry the boot core's CNTVOFF_EL2; the firmware leaves a non-zero one on the boot core
+// (about ten minutes on komodo). The boot core publishes its offset here before CPU_ON and the trampoline installs it.
+extern "C" volatile uint64_t armcpu_el2_cntvoff;
+volatile uint64_t armcpu_el2_cntvoff = 0;
 __asm__ (
     ".section __TEXT,__text,regular,pure_instructions\n"
     ".p2align 6\n"
@@ -34,7 +39,10 @@ __asm__ (
     "  mrs x1, cnthctl_el2\n"
     "  orr x1, x1, #3\n"                      // EL1PCTEN | EL1PCEN: physical counter and timer at EL1
     "  msr cnthctl_el2, x1\n"
-    "  msr cntvoff_el2, xzr\n"
+    "  adrp x2, _armcpu_el2_cntvoff@PAGE\n"   // the kernel's static mapping has one physical offset for text and data
+    "  add x2, x2, _armcpu_el2_cntvoff@PAGEOFF\n"
+    "  ldr x2, [x2]\n"
+    "  msr cntvoff_el2, x2\n"                 // the boot core's virtual counter offset, so CNTVCT_EL0 agrees across cores
     "  mov x1, #0x33ff\n"                     // CPTR_EL2 reset value with TFP clear: no FP/SIMD trapping
     "  msr cptr_el2, x1\n"
     "  msr hstr_el2, xzr\n"
@@ -89,6 +97,7 @@ volatile uint32_t armcpu_smp_step[8], armcpu_smp_mpidr[8], armcpu_smp_seen_mpidr
 // System registers seen on each secondary core at initCPU entry: CurrentEL, SCTLR_EL1, TCR_EL1, MAIR_EL1 (low words), MIDR_EL1.
 volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5];
 volatile int32_t armcpu_smp_psci_rc[8];
+volatile uint64_t armcpu_smp_cntvoff = 0;   // the boot core's CNTVOFF_EL2 as published to the secondaries
 }
 
 #define ARMCPU_SMP_SLOTS 8
@@ -545,6 +554,8 @@ void ArmCpu::startThread (void *argument, wait_result_t)
   armcpu_smp_step[self->logicalId] = 3;
   // Blocks until the new core reaches the scheduler; a core that never arrives only stalls this helper thread.
   processor_start (self->machProcessor);
+  IOLog ("ArmCpu: core %u (MPIDR %#llx) step %u, %u secondary cores running\n", self->logicalId, self->affinity,
+         armcpu_smp_step[self->logicalId], armcpu_smp_running);
   thread_terminate (current_thread ());
 }
 
@@ -817,6 +828,13 @@ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
   // reset vector through the context id.
   uint64_t entry = static_cast<uint64_t> (ml_static_vtop (reinterpret_cast<vm_offset_t> (armcpu_el2_trampoline)));
   uint64_t reset = static_cast<uint64_t> (ml_static_vtop (reinterpret_cast<vm_offset_t> (LowResetVectorBase)));
+  // The boot core's CNTVOFF_EL2 is CNTPCT_EL0 - CNTVCT_EL0 (both readable at EL1: the firmware grants EL1PCTEN, and the kernel's
+  // own physical-timer accesses already rely on it). One sample without an intervening ISB keeps the two reads adjacent.
+  uint64_t physical, virt;
+  __asm__ volatile ("isb; mrs %0, cntpct_el0; mrs %1, cntvct_el0" : "=r" (physical), "=r" (virt));
+  armcpu_el2_cntvoff = physical - virt;
+  armcpu_smp_cntvoff = armcpu_el2_cntvoff;
+  cleanToMemory (const_cast<uint64_t *> (&armcpu_el2_cntvoff), sizeof (armcpu_el2_cntvoff));
   cleanToMemory (armcpu_el2_trampoline, static_cast<size_t> (armcpu_el2_trampoline_end - armcpu_el2_trampoline));
   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
   cleanToMemory (ResetHandlerData, 0x1000);

@@ -30,6 +30,13 @@ volatile uint64_t armcpu_el2_cntvoff = 0;
 // line before reading them; they tell a core that never reached the trampoline from one that died in XNU's reset code.
 extern "C" volatile uint64_t armcpu_el2_arrived[8];
 volatile uint64_t armcpu_el2_arrived[8];
+// The kernel's reset vector, physical. PSCI says CPU_ON's context id reaches the entry point in x0, but
+// a core that ERETs to a wrong x0 is indistinguishable from one that dies later in the reset path, so the
+// trampoline takes the address from here and records what the firmware actually handed it.
+extern "C" volatile uint64_t armcpu_el2_reset;
+volatile uint64_t armcpu_el2_reset = 0;
+extern "C" volatile uint64_t armcpu_el2_context[8];
+volatile uint64_t armcpu_el2_context[8];
 __asm__ (
     ".section __TEXT,__text,regular,pure_instructions\n"
     ".p2align 6\n"
@@ -43,6 +50,17 @@ __asm__ (
     "  mov x5, #1\n"
     "  str x5, [x4]\n"
     "  dc cvac, x4\n"
+    "  adrp x6, _armcpu_el2_context@PAGE\n"    // what the firmware actually passed as the context id
+    "  add x6, x6, _armcpu_el2_context@PAGEOFF\n"
+    "  add x6, x6, x3, lsl #3\n"
+    "  str x0, [x6]\n"
+    "  dc cvac, x6\n"
+    "  adrp x7, _armcpu_el2_reset@PAGE\n"      // the entry this core must reach, published by the boot core
+    "  add x7, x7, _armcpu_el2_reset@PAGEOFF\n"
+    "  ldr x7, [x7]\n"
+    "  cbz x7, 2f\n"
+    "  mov x0, x7\n"
+    "2:\n"
     "  dsb sy\n"
     "  mrs x1, CurrentEL\n"
     "  cmp x1, #0x8\n"
@@ -582,10 +600,20 @@ void ArmCpu::startThread (void *argument, wait_result_t)
   for (unsigned waited = 0; waited < 50 && armcpu_smp_step[self->logicalId] < 7; waited++) { IOSleep (100); }
   const unsigned slot = static_cast<unsigned> ((self->affinity >> 8) & 7);
   __asm__ volatile ("dc civac, %0; dsb sy; isb" :: "r" (&armcpu_el2_arrived[slot]) : "memory");
-  IOLog ("ArmCpu: core %u (MPIDR %#llx) psci=%d trampoline=%llu step=%u fail=%u seen=%#x cntvoff=%#llx, %u secondary cores running\n",
-         self->logicalId, self->affinity, armcpu_smp_psci_rc[self->logicalId], armcpu_el2_arrived[slot],
-         armcpu_smp_step[self->logicalId], armcpu_smp_fail[self->logicalId], armcpu_smp_seen_mpidr[self->logicalId],
-         armcpu_smp_cntvoff, armcpu_smp_running);
+  __asm__ volatile ("dc civac, %0; dsb sy; isb" :: "r" (&armcpu_el2_context[slot]) : "memory");
+  // PSCI AFFINITY_INFO: 0 the firmware still has this core powered on, 1 off, 2 on-pending. A core that
+  // is on but never reached initCPU is stuck inside the kernel's reset path rather than missing.
+  bool hvc = false;
+  int64_t affinityInfo = -1;
+  if (psciConduit (&hvc)) {
+    affinityInfo = psciCall (hvc, 0xc4000004ULL, self->affinity & 0xff00ffffffULL, 0, 0);
+  }
+  IOLog ("ArmCpu: core %u (MPIDR %#llx) psci=%d affinity=%lld trampoline=%llu context=%#llx expected=%#llx "
+         "step=%u fail=%u seen=%#x, %u secondary cores running\n",
+         self->logicalId, self->affinity, armcpu_smp_psci_rc[self->logicalId], affinityInfo,
+         armcpu_el2_arrived[slot], armcpu_el2_context[slot], armcpu_el2_reset,
+         armcpu_smp_step[self->logicalId], armcpu_smp_fail[self->logicalId],
+         armcpu_smp_seen_mpidr[self->logicalId], armcpu_smp_running);
   thread_terminate (current_thread ());
 }
 
@@ -864,7 +892,10 @@ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
   __asm__ volatile ("isb; mrs %0, cntpct_el0; mrs %1, cntvct_el0" : "=r" (physical), "=r" (virt));
   armcpu_el2_cntvoff = physical - virt;
   armcpu_smp_cntvoff = armcpu_el2_cntvoff;
+  armcpu_el2_reset = reset;
   cleanToMemory (const_cast<uint64_t *> (&armcpu_el2_cntvoff), sizeof (armcpu_el2_cntvoff));
+  cleanToMemory (const_cast<uint64_t *> (&armcpu_el2_reset), sizeof (armcpu_el2_reset));
+  cleanToMemory (const_cast<uint64_t *> (armcpu_el2_context), sizeof (armcpu_el2_context));
   cleanToMemory (const_cast<uint64_t *> (armcpu_el2_arrived), sizeof (armcpu_el2_arrived));
   cleanToMemory (armcpu_el2_trampoline, static_cast<size_t> (armcpu_el2_trampoline_end - armcpu_el2_trampoline));
   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable

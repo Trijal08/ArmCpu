@@ -25,11 +25,25 @@ extern "C" char armcpu_el2_trampoline[], armcpu_el2_trampoline_end[];
 // (about ten minutes on komodo). The boot core publishes its offset here before CPU_ON and the trampoline installs it.
 extern "C" volatile uint64_t armcpu_el2_cntvoff;
 volatile uint64_t armcpu_el2_cntvoff = 0;
+// Breadcrumbs the trampoline leaves with the MMU off, one per MPIDR affinity-1 value (the cluster-less core number on
+// zumapro): 1 on entry, 2 right before the ERET, 3 when the core was already at EL1. The boot core invalidates the
+// line before reading them; they tell a core that never reached the trampoline from one that died in XNU's reset code.
+extern "C" volatile uint64_t armcpu_el2_arrived[8];
+volatile uint64_t armcpu_el2_arrived[8];
 __asm__ (
     ".section __TEXT,__text,regular,pure_instructions\n"
     ".p2align 6\n"
     ".globl _armcpu_el2_trampoline\n"
     "_armcpu_el2_trampoline:\n"
+    "  mrs x3, mpidr_el1\n"                   // breadcrumb slot: affinity 1 (0x100 steps on zumapro) masked to 0..7
+    "  ubfx x3, x3, #8, #3\n"
+    "  adrp x4, _armcpu_el2_arrived@PAGE\n"
+    "  add x4, x4, _armcpu_el2_arrived@PAGEOFF\n"
+    "  add x4, x4, x3, lsl #3\n"
+    "  mov x5, #1\n"
+    "  str x5, [x4]\n"
+    "  dc cvac, x4\n"
+    "  dsb sy\n"
     "  mrs x1, CurrentEL\n"
     "  cmp x1, #0x8\n"
     "  b.ne 1f\n"
@@ -62,9 +76,17 @@ __asm__ (
     "  mov x1, #0x3c5\n"                      // SPSR_EL2: EL1h, DAIF masked
     "  msr spsr_el2, x1\n"
     "  msr elr_el2, x0\n"
+    "  mov x5, #2\n"
+    "  str x5, [x4]\n"
+    "  dc cvac, x4\n"
+    "  dsb sy\n"
     "  isb\n"
     "  eret\n"
     "1:\n"
+    "  mov x5, #3\n"
+    "  str x5, [x4]\n"
+    "  dc cvac, x4\n"
+    "  dsb sy\n"
     "  br x0\n"
     ".globl _armcpu_el2_trampoline_end\n"
     "_armcpu_el2_trampoline_end:\n"
@@ -554,8 +576,16 @@ void ArmCpu::startThread (void *argument, wait_result_t)
   armcpu_smp_step[self->logicalId] = 3;
   // Blocks until the new core reaches the scheduler; a core that never arrives only stalls this helper thread.
   processor_start (self->machProcessor);
-  IOLog ("ArmCpu: core %u (MPIDR %#llx) step %u, %u secondary cores running\n", self->logicalId, self->affinity,
-         armcpu_smp_step[self->logicalId], armcpu_smp_running);
+  // processor_start returns as soon as CPU_ON is issued; give the core up to five seconds to reach the scheduler, then
+  // report what it left behind: the PSCI return code, the trampoline breadcrumb (invalidated first, the core wrote it with
+  // caches off), the bring-up step, the failure code and the MPIDR it saw.
+  for (unsigned waited = 0; waited < 50 && armcpu_smp_step[self->logicalId] < 7; waited++) { IOSleep (100); }
+  const unsigned slot = static_cast<unsigned> ((self->affinity >> 8) & 7);
+  __asm__ volatile ("dc civac, %0; dsb sy; isb" :: "r" (&armcpu_el2_arrived[slot]) : "memory");
+  IOLog ("ArmCpu: core %u (MPIDR %#llx) psci=%d trampoline=%llu step=%u fail=%u seen=%#x cntvoff=%#llx, %u secondary cores running\n",
+         self->logicalId, self->affinity, armcpu_smp_psci_rc[self->logicalId], armcpu_el2_arrived[slot],
+         armcpu_smp_step[self->logicalId], armcpu_smp_fail[self->logicalId], armcpu_smp_seen_mpidr[self->logicalId],
+         armcpu_smp_cntvoff, armcpu_smp_running);
   thread_terminate (current_thread ());
 }
 
@@ -835,6 +865,7 @@ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
   armcpu_el2_cntvoff = physical - virt;
   armcpu_smp_cntvoff = armcpu_el2_cntvoff;
   cleanToMemory (const_cast<uint64_t *> (&armcpu_el2_cntvoff), sizeof (armcpu_el2_cntvoff));
+  cleanToMemory (const_cast<uint64_t *> (armcpu_el2_arrived), sizeof (armcpu_el2_arrived));
   cleanToMemory (armcpu_el2_trampoline, static_cast<size_t> (armcpu_el2_trampoline_end - armcpu_el2_trampoline));
   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
   cleanToMemory (ResetHandlerData, 0x1000);

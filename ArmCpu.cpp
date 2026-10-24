@@ -109,6 +109,46 @@ __asm__ (
     ".globl _armcpu_el2_trampoline_end\n"
     "_armcpu_el2_trampoline_end:\n"
 );
+extern "C" vm_offset_t ml_static_ptovirt (vm_offset_t);
+// The search the kernel's reset vector runs with its MMU and caches off, replicated here so the boot core
+// can see what a stuck secondary sees. ResetHandlerData.cpu_data_entries holds the physical CpuDataEntries
+// array, which start.s scans for an entry whose cpu_data.cpu_phys_id equals MPIDR[15:0]; it then requires
+// cpu_reset_handler to be start_cpu or resume_idle_cpu. If the scan falls off the end, or the handler is
+// null or unrecognised, start.s lands on a bare branch-to-self. A core reporting affinity=0 with step=4 is
+// spinning on exactly such a branch. Offsets are this build's own assym.s values: cpu_data_entries at 8 in
+// reset_handler_data, cpu_data_paddr at 0 in cpu_data_entry, cpu_reset_handler at 168, cpu_istackptr at 16
+// and cpu_phys_id at 440 in cpu_data.
+struct ArmCpuResetEntry {
+  uint64_t entriesPhys, paddr, handler, istack;
+  uint32_t physId;
+  bool     found;
+};
+
+static ArmCpuResetEntry armcpuResetEntryFor (uint32_t physId)
+{
+  ArmCpuResetEntry view = {};
+
+  view.entriesPhys = *reinterpret_cast<const uint64_t *> (ResetHandlerData + 8);
+  if (!view.entriesPhys) { return view; }
+  const uint8_t *entries =
+    reinterpret_cast<const uint8_t *> (ml_static_ptovirt (static_cast<vm_offset_t> (view.entriesPhys)));
+  if (!entries) { return view; }
+  for (unsigned index = 0; index < 8; index++) {
+    uint64_t paddr = *reinterpret_cast<const uint64_t *> (entries + 16 * index);
+    if (!paddr) { continue; }
+    const uint8_t *data = reinterpret_cast<const uint8_t *> (ml_static_ptovirt (static_cast<vm_offset_t> (paddr)));
+    if (!data) { continue; }
+    if (*reinterpret_cast<const uint32_t *> (data + 440) != physId) { continue; }
+    view.found   = true;
+    view.paddr   = paddr;
+    view.physId  = physId;
+    view.handler = *reinterpret_cast<const uint64_t *> (data + 168);
+    view.istack  = *reinterpret_cast<const uint64_t *> (data + 16);
+    return view;
+  }
+  return view;
+}
+
 extern "C" kern_return_t processor_start (processor_t);
 extern "C" kern_return_t kernel_thread_start (void (*) (void *, wait_result_t), void *, thread_t *);
 extern "C" void thread_deallocate (thread_t);
@@ -608,12 +648,16 @@ void ArmCpu::startThread (void *argument, wait_result_t)
   if (psciConduit (&hvc)) {
     affinityInfo = psciCall (hvc, 0xc4000004ULL, self->affinity & 0xff00ffffffULL, 0, 0);
   }
+  const ArmCpuResetEntry entry = armcpuResetEntryFor (static_cast<uint32_t> (self->affinity & 0xffff));
   IOLog ("ArmCpu: core %u (MPIDR %#llx) psci=%d affinity=%lld trampoline=%llu context=%#llx expected=%#llx "
          "step=%u fail=%u seen=%#x, %u secondary cores running\n",
          self->logicalId, self->affinity, armcpu_smp_psci_rc[self->logicalId], affinityInfo,
          armcpu_el2_arrived[slot], armcpu_el2_context[slot], armcpu_el2_reset,
          armcpu_smp_step[self->logicalId], armcpu_smp_fail[self->logicalId],
          armcpu_smp_seen_mpidr[self->logicalId], armcpu_smp_running);
+  IOLog ("ArmCpu: core %u reset-vector view: entries=%#llx found=%u phys_id=%#x cpu_data=%#llx handler=%#llx istack=%#llx\n",
+         self->logicalId, entry.entriesPhys, entry.found ? 1u : 0u, entry.physId, entry.paddr,
+         entry.handler, entry.istack);
   thread_terminate (current_thread ());
 }
 
